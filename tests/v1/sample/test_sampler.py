@@ -7,9 +7,14 @@ import torch
 
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
+from vllm.sampling_params import SamplingParams
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
-from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor import (
+    BatchUpdate,
+    LogitBiasLogitsProcessor,
+    LogitsProcessors,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
@@ -164,6 +169,52 @@ def _create_default_sampling_metadata(
         logitsprocs=LogitsProcessors(),
     )
     return fake_sampling_metadata
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("repetition", [1.0, 2.0])
+@pytest.mark.parametrize(
+    "mode", ["raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"]
+)
+def test_logit_bias_mask_penalty_and_logprob_contract(device, repetition, mode):
+    """Guard current score semantics while the centering policy is unresolved."""
+    torch.set_default_device(device)
+    raw = torch.tensor([[17.0, 16.0, 100.0, 101.0]]).repeat(2, 1)
+    metadata = _create_default_sampling_metadata(0, 2, 4, torch.device(device))
+    metadata.max_num_logprobs = -1
+    metadata.prompt_token_ids = torch.tensor([[0], [0]], dtype=torch.int64)
+    metadata.output_token_ids = [[], []]
+    metadata.no_penalties = repetition == 1.0
+    metadata.repetition_penalties = torch.tensor([repetition, 1.0])
+    metadata.allowed_token_ids_mask = torch.tensor([[False, False, True, True]]).repeat(
+        2, 1
+    )
+    processor = LogitBiasLogitsProcessor(None, raw.device, False)
+    processor.update_state(
+        BatchUpdate(
+            batch_size=2,
+            removed=[],
+            added=[(0, SamplingParams(logit_bias={0: 0.25}), None, [])],
+            moved=[],
+        )
+    )
+    metadata.logitsprocs = LogitsProcessors([processor])
+    out = Sampler(logprobs_mode=mode)(raw.clone(), metadata)
+
+    expected = (
+        raw
+        if mode.startswith("raw")
+        else torch.tensor(
+            [
+                [17.25 / repetition, 16.0, -torch.inf, -torch.inf],
+                [17.0, 16.0, -torch.inf, -torch.inf],
+            ]
+        )
+    )
+    if mode.endswith("logprobs"):
+        expected = expected.log_softmax(dim=-1)
+    torch.testing.assert_close(out.logprobs_tensors.logprobs, expected)
+    assert out.sampled_token_ids.flatten().tolist() == [int(repetition == 2.0), 0]
 
 
 def _create_weighted_output_token_list(
