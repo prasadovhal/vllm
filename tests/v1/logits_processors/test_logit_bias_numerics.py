@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU design probes for #61771, not validation of a production hardening fix.
+"""CPU coverage of the experimental production centering helper for #61771.
 
-The reference keeps centering outside production until its compatibility policy
-is agreed. Run independently of the model fixtures with --confcutdir set to this
-directory. Runtime regressions also live in the existing V1/V2 processor suites.
+Run without model fixtures using --confcutdir set to this directory. Full
+processor and sampler integration is covered separately in the V1/V2 suites.
 """
 
-import math
 import struct
 
 import pytest
 import torch
+
+from vllm.v1.sample.ops.logit_bias import LogitBiasCentering
 
 D = 2.0**-19
 
@@ -22,26 +22,20 @@ def _use_cpu():
         yield
 
 
-def _bias_reference(logits, biases, *, center, allowed=None):
-    """Model masking, optional finite centering, then sparse FP32 bias addition."""
+def _apply_bias(logits, biases, *, center, allowed=None):
+    """Surround the production centering operation with masks and sparse bias."""
     out = logits.clone()
-    for row, bias in enumerate(biases):
+    for row in range(len(biases)):
         if allowed is not None and allowed[row]:
             mask = torch.ones(out.shape[1], dtype=torch.bool)
             mask[allowed[row]] = False
             out[row, mask] = -torch.inf
-        bias = {
-            token: torch.tensor(value, dtype=torch.float32).item()
-            for token, value in (bias or {}).items()
-        }
-        if center and any(
-            math.isfinite(value) and value != 0 and torch.isfinite(out[row, token])
-            for token, value in bias.items()
-        ):
-            finite = torch.isfinite(out[row])
-            if finite.any():
-                out[row] -= out[row, finite].max()
-        for token, value in bias.items():
+    if center:
+        LogitBiasCentering(
+            {row: bias for row, bias in enumerate(biases) if bias}, out.device
+        ).apply(out)
+    for row, bias in enumerate(biases):
+        for token, value in (bias or {}).items():
             out[row, token] += value
     return out
 
@@ -76,13 +70,17 @@ def test_issue_61771_standard_library_reproducer():
     assert observed == [(1, 1, 1), (0, 1, 0)]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#61771: direct FP32 bias addition is not common-offset invariant",
+@pytest.mark.parametrize(
+    "center",
+    [
+        pytest.param(False, marks=pytest.mark.xfail(strict=True, reason="Legacy bias")),
+        True,
+    ],
 )
-def test_direct_fp32_bias_addition_is_offset_invariant():
+def test_fp32_bias_addition_is_offset_invariant(center):
     logits = _exact_shift_pair()
-    biased = logits + torch.tensor([15.0 - D, 15.0 + 2 * D])
+    bias = {0: 15.0 - D, 1: 15.0 + 2 * D}
+    biased = _apply_bias(logits, [bias, bias], center=center)
     assert biased.argmax(dim=-1).tolist() == [1, 1]
 
 
@@ -94,7 +92,7 @@ def test_centering_preserves_exact_shift_pairs(shift, bias):
     original = torch.tensor([17.0, 17.0 - 2 * D])
     shifted = original + shift
     assert torch.equal(shifted.double() - original.double(), torch.full((2,), shift))
-    out = _bias_reference(torch.stack([original, shifted]), [bias, bias], center=True)
+    out = _apply_bias(torch.stack([original, shifted]), [bias, bias], center=True)
     assert torch.equal(out[0], out[1])
     assert out[0].argmax() == out[1].argmax()
 
@@ -109,7 +107,7 @@ def test_inexact_input_shift_is_outside_invariance_contract():
 
 @pytest.mark.parametrize("bias,winner", [({1: 2 * D}, 0), ({1: 3 * D}, 1)])
 def test_centered_near_tie_and_first_index_tie_break(bias, winner):
-    out = _bias_reference(_exact_shift_pair(), [bias, bias], center=True)
+    out = _apply_bias(_exact_shift_pair(), [bias, bias], center=True)
     assert out.argmax(dim=-1).tolist() == [winner, winner]
 
 
@@ -126,8 +124,8 @@ def test_mixed_batch_only_centers_rows_with_finite_nonzero_bias():
         {1: 2.0},
     ]
     logits = torch.tensor([[18.0, 17.0]]).repeat(len(biases), 1)
-    legacy = _bias_reference(logits, biases, center=False)
-    centered = _bias_reference(logits, biases, center=True)
+    legacy = _apply_bias(logits, biases, center=False)
+    centered = _apply_bias(logits, biases, center=True)
     torch.testing.assert_close(
         centered[:-1], legacy[:-1], rtol=0, atol=0, equal_nan=True
     )
@@ -148,7 +146,7 @@ def test_mixed_batch_only_centers_rows_with_finite_nonzero_bias():
 )
 def test_centering_does_not_create_nans_or_rewrite_nonfinite_logits(values):
     logits = torch.tensor([values])
-    out = _bias_reference(logits, [{0: 1.0}], center=True)
+    out = _apply_bias(logits, [{0: 1.0}], center=True)
     assert torch.equal(torch.isnan(out), torch.isnan(logits))
     nonfinite = ~torch.isfinite(logits)
     torch.testing.assert_close(out[nonfinite], logits[nonfinite], equal_nan=True)
@@ -160,7 +158,7 @@ def test_allowed_tokens_define_the_center_and_empty_rows_stay_masked(all_masked)
     if all_masked:
         logits.fill_(-torch.inf)
     bias = {0: 15.0 - D, 1: 15.0 + 2 * D, 2: 100.0}
-    out = _bias_reference(logits, [bias, bias], center=True, allowed=[[0, 1]] * 2)
+    out = _apply_bias(logits, [bias, bias], center=True, allowed=[[0, 1]] * 2)
     assert not torch.isnan(out).any()
     if not all_masked:
         assert out.argmax(dim=-1).tolist() == [1, 1]
@@ -173,8 +171,8 @@ def test_allowed_tokens_define_the_center_and_empty_rows_stay_masked(all_masked)
 def test_bias_on_only_masked_tokens_does_not_rebase_eligible_scores():
     logits = torch.tensor([[17.0, 16.0, 100.0]])
     bias = [{2: 1.0}]
-    legacy = _bias_reference(logits, bias, center=False, allowed=[[0, 1]])
-    centered = _bias_reference(logits, bias, center=True, allowed=[[0, 1]])
+    legacy = _apply_bias(logits, bias, center=False, allowed=[[0, 1]])
+    centered = _apply_bias(logits, bias, center=True, allowed=[[0, 1]])
     assert torch.equal(centered, legacy)
 
 
@@ -182,8 +180,8 @@ def test_centering_before_repetition_penalty_changes_a_non_tied_winner():
     """Preserving stage order alone does not preserve repetition semantics."""
     logits = torch.tensor([[17.0, 16.0]])
     bias = [{0: 0.25}]
-    legacy = _bias_reference(logits, bias, center=False)
-    centered = _bias_reference(logits, bias, center=True)
+    legacy = _apply_bias(logits, bias, center=False)
+    centered = _apply_bias(logits, bias, center=True)
     # Token 0 occurred before; both pipelines apply repetition penalty after bias.
     for scores in (legacy, centered):
         scores[:, 0] = torch.where(scores[:, 0] > 0, scores[:, 0] / 2, scores[:, 0] * 2)
@@ -197,8 +195,8 @@ def test_raw_scores_are_preserved_but_processed_scores_change():
     raw = _exact_shift_pair()
     saved = raw.clone()
     bias = {0: 15.0 - D, 1: 15.0 + 2 * D}
-    legacy = _bias_reference(raw, [bias, bias], center=False)
-    centered = _bias_reference(raw, [bias, bias], center=True)
+    legacy = _apply_bias(raw, [bias, bias], center=False)
+    centered = _apply_bias(raw, [bias, bias], center=True)
     assert torch.equal(raw, saved)
     assert torch.equal(raw.log_softmax(-1), saved.log_softmax(-1))
     assert not torch.equal(legacy, centered)
@@ -206,9 +204,9 @@ def test_raw_scores_are_preserved_but_processed_scores_change():
     assert torch.equal(centered[0].log_softmax(-1), centered[1].log_softmax(-1))
 
 
-def test_finite_extremes_can_overflow_during_centering():
-    """Finite-only max avoids NaNs but does not guarantee finite differences."""
+def test_finite_extremes_skip_centering_when_the_range_would_overflow():
+    """Do not turn a finite score into a mask as a side effect of centering."""
     limit = torch.finfo(torch.float32).max
-    out = _bias_reference(torch.tensor([[limit, -limit]]), [{0: 1.0}], center=True)
-    assert not torch.isnan(out).any()
-    assert torch.isneginf(out[0, 1])
+    logits = torch.tensor([[limit, -limit]])
+    out = _apply_bias(logits, [{0: 1.0}], center=True)
+    assert torch.equal(out, logits)

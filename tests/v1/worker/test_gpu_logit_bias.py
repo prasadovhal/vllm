@@ -13,6 +13,7 @@ if not torch.cuda.is_available():
     )
 
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.sample.ops.logit_bias import LogitBiasCentering
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logits_processor import (
     LogitsContext,
@@ -29,6 +30,13 @@ MIN_TOKENS = 10
 # min_len is PROMPT_LEN + MIN_TOKENS, so this position is below the minimum
 # and the kernel masks stop tokens.
 POS = 5
+
+
+@pytest.fixture(autouse=True)
+def _cpu_default_device():
+    # Other sampler suites change the default device; references stay on CPU.
+    with torch.device("cpu"):
+        yield
 
 
 def _params(structured: bool) -> SamplingParams:
@@ -53,7 +61,7 @@ def _apply(logits: torch.Tensor, structured: list[bool]) -> torch.Tensor:
     return _apply_params(logits, [_params(value) for value in structured])
 
 
-def _apply_params(logits, params, expanded_mapping=None):
+def _apply_params(logits, params, expanded_mapping=None, *, center=False):
     req_states = RequestState(
         max_num_reqs=4,
         max_model_len=64,
@@ -65,7 +73,11 @@ def _apply_params(logits, params, expanded_mapping=None):
     # add_request() reads prompt_len per slot; every slot here uses the same one.
     req_states.prompt_len.np[:] = PROMPT_LEN
 
-    state = LogitBiasState(None, LogitsProcRequestState.from_request_state(req_states))
+    state = LogitBiasState(
+        None,
+        LogitsProcRequestState.from_request_state(req_states),
+        _center_logit_bias=center,
+    )
     for req_idx, sampling_params in enumerate(params):
         state.add_request(req_idx, sampling_params)
     state.apply_staged_writes()
@@ -93,11 +105,8 @@ def _apply_params(logits, params, expanded_mapping=None):
     return logits.cpu()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#61771: pre-bias centering policy is pending maintainer agreement",
-)
-def test_v2_logit_bias_exact_offset_with_expanded_mapping_and_allowed_tokens():
+@pytest.mark.parametrize("center", [False, True])
+def test_v2_logit_bias_exact_offset_with_expanded_mapping_and_allowed_tokens(center):
     """Exercise the kernel mapping, not public bias-plus-speculation support."""
     d = 2.0**-19
     logits = torch.full((3, VOCAB_SIZE), 2.0**30, device=DEVICE)
@@ -113,33 +122,96 @@ def test_v2_logit_bias_exact_offset_with_expanded_mapping_and_allowed_tokens():
             logit_bias={0: 15.0 - d, 1: 15.0 + 2 * d}, allowed_token_ids=[0, 1]
         ),
     ]
-    out = _apply_params(logits, params, expanded_mapping=[1, 0, 1])
+    out = _apply_params(logits, params, expanded_mapping=[1, 0, 1], center=center)
     assert torch.equal(out[1], original[1])
     assert torch.isneginf(out[[0, 2], 2:]).all()
-    assert out[[0, 2]].argmax(dim=-1).tolist() == [1, 1]
+    assert out[[0, 2]].argmax(dim=-1).tolist() == ([1, 1] if center else [1, 0])
 
 
 @pytest.mark.parametrize("bias", [None, {}, {0: 0.0}, {0: -0.0}])
-def test_v2_logit_bias_unaffected_row_in_mixed_batch(bias):
+@pytest.mark.parametrize("center", [False, True])
+def test_v2_logit_bias_unaffected_row_in_mixed_batch(bias, center):
     logits = torch.full((2, VOCAB_SIZE), 17.0, device=DEVICE)
     out = _apply_params(
-        logits, [SamplingParams(logit_bias=bias), SamplingParams(logit_bias={1: 2.0})]
+        logits,
+        [SamplingParams(logit_bias=bias), SamplingParams(logit_bias={1: 2.0})],
+        center=center,
     )
     assert torch.equal(out[0], torch.full((VOCAB_SIZE,), 17.0))
     assert out[1].argmax().item() == 1
 
 
 @pytest.mark.parametrize("structured", [False, True])
-def test_v2_finite_bias_preserves_min_tokens_empty_row_recovery(structured):
+@pytest.mark.parametrize("center", [False, True])
+def test_v2_finite_bias_preserves_min_tokens_empty_row_recovery(structured, center):
     params = _params(structured)
     params.logit_bias = {STOP_TOKEN: 1.0}
-    out = _apply_params(_only_stop_token_left(1), [params])
+    out = _apply_params(_only_stop_token_left(1), [params], center=center)
     assert not torch.isnan(out).any()
     if structured:
         assert torch.isfinite(out[0, STOP_TOKEN])
         assert out.argmax(dim=-1).item() == STOP_TOKEN
     else:
         assert torch.isneginf(out).all()
+
+
+@pytest.mark.parametrize(
+    "values,bias,allowed",
+    [
+        ([17.0, 17.0 - 2**-18], {0: -15.0, 1: -15.0 + 2**-19}, None),
+        ([17.0, 17.0 - 2**-18], {1: 2**-18}, None),
+        ([17.0, 16.0, 100.0], {2: 1.0}, [0, 1]),
+        ([-torch.inf, -torch.inf], {0: 1.0}, None),
+        ([torch.inf, -torch.inf], {0: 1.0}, None),
+        ([17.0, torch.inf, torch.nan, -torch.inf], {0: 1.0}, None),
+        ([17.0, 16.0], {0: torch.nan}, None),
+        ([17.0, 16.0], {0: torch.inf}, None),
+        ([17.0, 16.0], {0: -torch.inf}, None),
+        ([17.0, 16.0], {0: 2**-150}, None),
+        (
+            [torch.finfo(torch.float32).max, -torch.finfo(torch.float32).max],
+            {0: 1.0},
+            None,
+        ),
+    ],
+)
+def test_v2_centering_matches_torch_on_edge_cases(values, bias, allowed):
+    logits = torch.full((1, VOCAB_SIZE), -torch.inf, device=DEVICE)
+    logits[0, : len(values)] = torch.tensor(values, device=DEVICE)
+    expected = logits.cpu()
+    if allowed:
+        mask = torch.ones(VOCAB_SIZE, dtype=torch.bool)
+        mask[allowed] = False
+        expected[:, mask] = -torch.inf
+    LogitBiasCentering({0: bias}, torch.device("cpu")).apply(expected)
+    for token, value in bias.items():
+        expected[0, token] += value
+    actual = _apply_params(
+        logits,
+        [SamplingParams(logit_bias=bias, allowed_token_ids=allowed)],
+        center=True,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    if bias == {1: 2**-18}:
+        assert actual.argmax().item() == 0
+
+
+def test_v2_centering_scans_multiple_blocks_and_respects_row_stride():
+    backing = torch.full((3, 8205), 17.0, device=DEVICE)
+    logits = backing[:, 3:-3]
+    logits[:, -1] = 18.0
+    expected = logits.cpu()
+    LogitBiasCentering({0: {0: 2.0}, 2: {0: 2.0}}, torch.device("cpu")).apply(expected)
+    expected[[0, 2], 0] += 2.0
+    actual = _apply_params(
+        logits,
+        [SamplingParams(logit_bias={0: 2.0}), SamplingParams()],
+        expanded_mapping=[0, 1, 0],
+        center=True,
+    )
+    assert torch.equal(actual, expected)
+    assert torch.all(backing[:, :3] == 17.0)
+    assert torch.all(backing[:, -3:] == 17.0)
 
 
 def test_v2_min_tokens_restores_stop_token_when_row_would_be_empty():

@@ -173,11 +173,12 @@ def _create_default_sampling_metadata(
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("repetition", [1.0, 2.0])
+@pytest.mark.parametrize("center", [False, True])
 @pytest.mark.parametrize(
     "mode", ["raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"]
 )
-def test_logit_bias_mask_penalty_and_logprob_contract(device, repetition, mode):
-    """Guard current score semantics while the centering policy is unresolved."""
+def test_logit_bias_mask_penalty_and_logprob_contract(device, repetition, mode, center):
+    """Opt-in centering preserves stage order, but changes penalty semantics."""
     torch.set_default_device(device)
     raw = torch.tensor([[17.0, 16.0, 100.0, 101.0]]).repeat(2, 1)
     metadata = _create_default_sampling_metadata(0, 2, 4, torch.device(device))
@@ -189,7 +190,9 @@ def test_logit_bias_mask_penalty_and_logprob_contract(device, repetition, mode):
     metadata.allowed_token_ids_mask = torch.tensor([[False, False, True, True]]).repeat(
         2, 1
     )
-    processor = LogitBiasLogitsProcessor(None, raw.device, False)
+    processor = LogitBiasLogitsProcessor(
+        None, raw.device, False, _center_logit_bias=center
+    )
     processor.update_state(
         BatchUpdate(
             batch_size=2,
@@ -206,7 +209,9 @@ def test_logit_bias_mask_penalty_and_logprob_contract(device, repetition, mode):
         if mode.startswith("raw")
         else torch.tensor(
             [
-                [17.25 / repetition, 16.0, -torch.inf, -torch.inf],
+                [0.25 / repetition, -1.0, -torch.inf, -torch.inf]
+                if center
+                else [17.25 / repetition, 16.0, -torch.inf, -torch.inf],
                 [17.0, 16.0, -torch.inf, -torch.inf],
             ]
         )
@@ -214,7 +219,48 @@ def test_logit_bias_mask_penalty_and_logprob_contract(device, repetition, mode):
     if mode.endswith("logprobs"):
         expected = expected.log_softmax(dim=-1)
     torch.testing.assert_close(out.logprobs_tensors.logprobs, expected)
-    assert out.sampled_token_ids.flatten().tolist() == [int(repetition == 2.0), 0]
+    assert out.sampled_token_ids.flatten().tolist() == [
+        int(repetition == 2.0 and not center),
+        0,
+    ]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_centered_logit_bias_sampling_is_exact_offset_invariant(device, temperature):
+    torch.set_default_device(device)
+    d = 2.0**-19
+    raw = torch.tensor([[17.0, 17.0 - 2 * d], [18.0, 18.0 - 2 * d]])
+    metadata = _create_default_sampling_metadata(0, 2, 2, torch.device(device))
+    metadata.max_num_logprobs = -1
+    metadata.all_greedy = temperature == 0
+    metadata.all_random = temperature != 0
+    assert metadata.temperature is not None
+    metadata.temperature.fill_(temperature)
+    metadata.generators = {
+        row: torch.Generator(device=device).manual_seed(42) for row in range(2)
+    }
+    processor = LogitBiasLogitsProcessor(
+        None, raw.device, False, _center_logit_bias=True
+    )
+    processor.update_state(
+        BatchUpdate(
+            2,
+            [],
+            [
+                (row, SamplingParams(logit_bias={0: 15 - d, 1: 15 + 2 * d}), None, [])
+                for row in range(2)
+            ],
+            [],
+        )
+    )
+    metadata.logitsprocs = LogitsProcessors([processor])
+    out = Sampler(logprobs_mode="processed_logits")(raw, metadata)
+    scores = out.logprobs_tensors.logprobs
+    assert torch.equal(scores[0], scores[1])
+    assert out.sampled_token_ids[0] == out.sampled_token_ids[1]
+    if temperature == 0:
+        assert out.sampled_token_ids[0].item() == 1
 
 
 def _create_weighted_output_token_list(

@@ -23,7 +23,15 @@ MAX_NUM_STOP_TOKEN_IDS = 128
 
 
 class LogitBiasState(LogitsProcessor):
-    def __init__(self, vllm_config: "VllmConfig", req_states: LogitsProcRequestState):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        req_states: LogitsProcRequestState,
+        *,
+        _center_logit_bias: bool = False,
+    ):
+        # Internal experiment; keep existing sampling semantics by default.
+        self._center_logit_bias = _center_logit_bias
         self.prompt_len_np = req_states.prompt_len.np
         max_num_reqs = req_states.max_num_reqs
         device = req_states.device
@@ -151,6 +159,7 @@ class LogitBiasState(LogitsProcessor):
             self.restore_when_all_masked.gpu,
             self.stop_token_ids.gpu,
             enable_stop_token_restore,
+            _center_logit_bias=self._center_logit_bias,
         )
         return logits
 
@@ -181,6 +190,7 @@ def _bias_kernel(
     BLOCK_SIZE: tl.constexpr,
     LOGITS_BLOCK_SIZE: tl.constexpr,
     CHECK_ALL_MASKED_ROWS: tl.constexpr,
+    CENTER_LOGIT_BIAS: tl.constexpr,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
@@ -231,6 +241,56 @@ def _bias_kernel(
             mask=mask,
         )
         bias = tl.load(bias_ptr + req_state_idx * bias_stride + block, mask=mask)
+        if CENTER_LOGIT_BIAS:
+            # Allowed-token restores must be visible to both the gather and scan.
+            tl.debug_barrier()
+            target_logits = tl.load(
+                logits_ptr + token_idx * logits_stride + token_ids,
+                mask=mask,
+                other=-float("inf"),
+            ).to(tl.float32)
+            effective = (
+                mask
+                & (bias > -float("inf"))
+                & (bias < float("inf"))
+                & (bias != 0.0)
+                & (target_logits > -float("inf"))
+                & (target_logits < float("inf"))
+            )
+            if tl.sum(effective.to(tl.int32), axis=0) > 0:
+                row_max = tl.full((), -float("inf"), tl.float32)
+                row_min = tl.full((), float("inf"), tl.float32)
+                for i in range(0, vocab_size, LOGITS_BLOCK_SIZE):
+                    offset = i + tl.arange(0, LOGITS_BLOCK_SIZE)
+                    values = tl.load(
+                        logits_ptr + token_idx * logits_stride + offset,
+                        mask=offset < vocab_size,
+                        other=-float("inf"),
+                    ).to(tl.float32)
+                    finite = (values > -float("inf")) & (values < float("inf"))
+                    row_max = tl.maximum(
+                        row_max, tl.max(tl.where(finite, values, -float("inf")), 0)
+                    )
+                    row_min = tl.minimum(
+                        row_min, tl.min(tl.where(finite, values, float("inf")), 0)
+                    )
+                # Do not turn finite logits into masks through subtraction overflow.
+                if row_min - row_max > -float("inf"):
+                    for i in range(0, vocab_size, LOGITS_BLOCK_SIZE):
+                        offset = i + tl.arange(0, LOGITS_BLOCK_SIZE)
+                        values = tl.load(
+                            logits_ptr + token_idx * logits_stride + offset,
+                            mask=offset < vocab_size,
+                            other=-float("inf"),
+                        ).to(tl.float32)
+                        finite = (values > -float("inf")) & (values < float("inf"))
+                        tl.store(
+                            logits_ptr + token_idx * logits_stride + offset,
+                            tl.where(finite, values - row_max, values),
+                            mask=offset < vocab_size,
+                        )
+            # Sparse bias loads can be owned by different lanes than the stores.
+            tl.debug_barrier()
         logits = tl.load(logits_ptr + token_idx * logits_stride + token_ids, mask=mask)
         logits += bias
         tl.store(logits_ptr + token_idx * logits_stride + token_ids, logits, mask=mask)
@@ -314,6 +374,8 @@ def apply_logit_bias(
     restore_when_all_masked: torch.Tensor,
     stop_token_ids: torch.Tensor,
     check_all_masked_rows: bool = False,
+    *,
+    _center_logit_bias: bool = False,
 ) -> None:
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = triton.next_power_of_2(
@@ -346,4 +408,5 @@ def apply_logit_bias(
         BLOCK_SIZE=BLOCK_SIZE,
         LOGITS_BLOCK_SIZE=LOGITS_BLOCK_SIZE,
         CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
+        CENTER_LOGIT_BIAS=_center_logit_bias,
     )

@@ -68,8 +68,10 @@ THINK_END_TOKEN_ID = 998
 LogitprocType: TypeAlias = type[LogitsProcessor] | str
 
 
-def _apply_fp32_bias(logits, biases):
-    processor = LogitBiasLogitsProcessor(None, logits.device, False)
+def _apply_fp32_bias(logits, biases, *, center=False):
+    processor = LogitBiasLogitsProcessor(
+        None, logits.device, False, _center_logit_bias=center
+    )
     processor.update_state(
         BatchUpdate(
             batch_size=len(biases),
@@ -84,24 +86,22 @@ def _apply_fp32_bias(logits, biases):
     return processor.apply(logits)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#61771: pre-bias centering policy is pending maintainer agreement",
-)
-def test_logit_bias_exact_common_offset():
+@pytest.mark.parametrize("center", [False, True])
+def test_logit_bias_exact_common_offset(center):
     """The desired hardening must distinguish an exact shift from input rounding."""
     d = 2.0**-19
     logits = torch.tensor([[17.0, 17.0 - 2 * d], [18.0, 18.0 - 2 * d]])
     assert torch.equal(logits[1].double() - logits[0].double(), torch.ones(2))
     bias = {0: 15.0 - d, 1: 15.0 + 2 * d}
-    out = _apply_fp32_bias(logits, [bias, bias])
-    assert out.argmax(dim=-1).tolist() == [1, 1]
+    out = _apply_fp32_bias(logits, [bias, bias], center=center)
+    assert out.argmax(dim=-1).tolist() == ([1, 1] if center else [1, 0])
 
 
-def test_logit_bias_unaffected_rows_in_mixed_batch():
+@pytest.mark.parametrize("center", [False, True])
+def test_logit_bias_unaffected_rows_in_mixed_batch(center):
     logits = torch.tensor([[17.0, 16.0]]).repeat(4, 1)
     original = logits.clone()
-    out = _apply_fp32_bias(logits, [None, {}, {0: 0.0}, {1: 2.0}])
+    out = _apply_fp32_bias(logits, [None, {}, {0: 0.0}, {1: 2.0}], center=center)
     assert torch.equal(out[:3], original[:3])
     assert out[3].argmax().item() == 1
 
@@ -109,13 +109,32 @@ def test_logit_bias_unaffected_rows_in_mixed_batch():
 @pytest.mark.parametrize(
     "values", [[-torch.inf, -torch.inf], [torch.inf, -torch.inf], [torch.nan, 17.0]]
 )
-def test_logit_bias_preserves_nonfinite_logits(values):
+@pytest.mark.parametrize("center", [False, True])
+def test_logit_bias_preserves_nonfinite_logits(values, center):
     logits = torch.tensor([values])
     original = logits.clone()
-    out = _apply_fp32_bias(logits, [{0: 1.0}])
+    out = _apply_fp32_bias(logits, [{0: 1.0}], center=center)
     nonfinite = ~torch.isfinite(original)
     torch.testing.assert_close(out[nonfinite], original[nonfinite], equal_nan=True)
     assert torch.equal(torch.isnan(out), torch.isnan(original))
+
+
+def test_logit_bias_centering_tracks_moved_and_removed_requests():
+    processor = LogitBiasLogitsProcessor(
+        None, torch.device("cpu"), False, _center_logit_bias=True
+    )
+    processor.update_state(
+        BatchUpdate(2, [], [(0, SamplingParams(logit_bias={0: 0.25}), None, [])], [])
+    )
+    processor.update_state(BatchUpdate(2, [], [], [(0, 1, MoveDirectionality.SWAP)]))
+    logits = torch.tensor([[17.0, 16.0], [18.0, 17.0]], device="cpu")
+    assert torch.equal(
+        processor.apply(logits),
+        torch.tensor([[17.0, 16.0], [0.25, -1.0]], device="cpu"),
+    )
+    processor.update_state(BatchUpdate(2, [1], [], []))
+    logits = torch.tensor([[17.0, 16.0], [18.0, 17.0]], device="cpu")
+    assert torch.equal(processor.apply(logits.clone()), logits)
 
 
 class LogitsProcsRequestParams:

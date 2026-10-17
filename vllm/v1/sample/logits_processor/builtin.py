@@ -13,6 +13,7 @@ from vllm.v1.sample.logits_processor.interface import (
     LogitsProcessor,
     MoveDirectionality,
 )
+from vllm.v1.sample.ops.logit_bias import LogitBiasCentering
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -117,9 +118,20 @@ class MinPLogitsProcessor(LogitsProcessor):
 
 
 class LogitBiasLogitsProcessor(LogitsProcessor):
-    def __init__(self, _, device: torch.device, is_pin_memory: bool):
+    def __init__(
+        self,
+        _,
+        device: torch.device,
+        is_pin_memory: bool,
+        *,
+        _center_logit_bias: bool = False,
+    ):
         self.device = device
         self.biases: dict[int, dict[int, float]] = {}
+        # Internal experiment: centering changes ties and repetition penalties.
+        self._center_logit_bias = _center_logit_bias
+        self._is_pin_memory = is_pin_memory
+        self._centering: LogitBiasCentering | None = None
 
         self.bias_tensor: torch.Tensor = torch.tensor(())
         self.logits_slice = (
@@ -152,12 +164,18 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
                 self._device_tensor(reqs, torch.int32),
                 self._device_tensor(tok_ids, torch.int32),
             )
+            if self._center_logit_bias:
+                self._centering = LogitBiasCentering(
+                    self.biases, self.device, self._is_pin_memory
+                )
 
     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
         return async_tensor_h2d(data, device=self.device, dtype=dtype)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if self.biases:
+            if self._centering is not None:
+                self._centering.apply(logits)
             logits[self.logits_slice] += self.bias_tensor
         return logits
 
